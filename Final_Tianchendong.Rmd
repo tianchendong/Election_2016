@@ -1,0 +1,522 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+```{r include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE, results = 'hide', warning = FALSE, message = FALSE) 
+
+```
+
+
+```{r packages}
+library(tidyverse)
+library(tree)
+library(maptree)
+library(randomForest)
+library(gbm)
+library(ROCR)
+library(e1071)
+library(imager)
+library(kableExtra)
+library(maps)
+library(glmnet)
+```
+
+
+
+### Overview
+1. Voting behavior is a hard problem is because choosing the US president is a national problem , but also involves at state level. So both the national and state level need to be taken into account.  
+2. Nate Silver looked at the full range of probability so for each state he could calculated the probability of support and use the following day polling data to support his model.
+3. Every poll has error such as the nonresponse bias, and it has systematic error, and they often miss in the same direction.
+
+```{r load data}
+election.raw <- read_delim("data/election/election.csv", delim = ",") %>% mutate(candidate=as.factor(candidate))
+
+census_meta <- read_delim("data/census/metadata.csv", delim = ";", col_names = FALSE) 
+census <- read_delim("data/census/census.csv", delim = ",") 
+
+```
+
+
+### Election Data
+4. The Dimension of `election.raw` after remove rows with `fip` = 2000 is 18345 observations of 5 variables. The reason we remove these observations is that they are replications of the observations of `fip` = AK.
+
+```{r q4}
+election.raw <- election.raw[-which(election.raw$fips == 2000),]
+```
+
+### Data Wrangling
+
+5. After we split the data into `election_federal`, `election_state` and `election_county`. We report they have dimensions of 32, 302 and 18011 observations respectively.
+
+```{r q5}
+election_federal <- election.raw[which(election.raw$fips == "US"),]
+election_state <- election.raw[which(is.na(election.raw$county) & election.raw$fips != "US"),]
+election_county <- election.raw[which(!is.na(election.raw$county)),]
+```
+
+6. Using the data set `election_federal` we can report that there are 32 candidates, and the bar chart of all candidates against the log of the number of the votes is shown below.
+
+```{r q6, results= "markup"}
+ggplot(data = election_federal, mapping = aes(log(votes), candidate)) + 
+  geom_col()
+```
+
+
+7. First few rows of `county_winner` and `state_winner` are shown below
+
+```{r q7}
+county_winner <- election_county %>% group_by(fips) %>%
+  mutate(total = sum(votes)) %>%
+  mutate(pct = votes / total) %>%
+  top_n(1)
+
+
+state_winner <- election_state %>% group_by(fips) %>%
+  mutate(total = sum(votes)) %>%
+  mutate(pct = votes / total) %>% 
+  top_n(1)
+
+```
+```{r q7_2, results = "markup"}
+kable(head(county_winner))  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+
+kable(head(state_winner))  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+### Visialization
+
+8. 
+
+```{r q8, results = "markup"}
+states <- map_data("state")
+counties <- map_data("county")
+
+ggplot(data = counties) + 
+  geom_polygon(aes(x = long, y = lat, fill = subregion, group = group), color = "white") + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE)  # color legend is unnecessary and takes too long
+```
+
+9.  
+```{r q9}
+states <- states %>% mutate(fips = state.abb[match(region, tolower(state.name))]) %>% 
+  left_join(state_winner)
+```
+```{r q9_2, results = "markup"}
+ggplot(data = states) + 
+  geom_polygon(aes(x = long, y = lat, fill = candidate, group = group), color = "white") + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE)  # color legend is unnecessary and takes too long
+```
+
+10.  
+```{r q10}
+county.fips <- maps::county.fips %>%
+  separate(polyname, into = c("region", "subregion"), sep = ",")
+
+counties <- left_join(counties, county.fips)
+county_winner <- mutate(county_winner, fips = as.numeric(fips))
+counties <- left_join(counties, county_winner)
+```
+```{r q10_2, results="markup"}
+ggplot(data = counties) + 
+  geom_polygon(aes(x = long, y = lat, fill = candidate, group = group), color = "white") + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE)  # color legend is unnecessary and takes too long
+```
+
+11.  
+```{r q11, results = "markup"}
+totalWhite <- sum(na.omit(census$TotalPop * census$White))
+totalAsian <- sum(na.omit(census$TotalPop * census$Asian))
+totalHispanic <- sum(na.omit(census$TotalPop * census$Hispanic))
+totalBlack <- sum(na.omit(census$TotalPop * census$Black))
+totalNative <- sum(na.omit(census$TotalPop * census$Native))
+totalPacific <- sum(na.omit(census$TotalPop * census$Pacific))
+
+pie(c(totalWhite, totalAsian, totalHispanic, totalBlack, totalNative, totalPacific), 
+    labels = c("White", "Asian", "Hispanic", "Black", "Native", "Pacific"),
+    main = "Distribution of White and Minority at National Level")
+```
+
+
+
+12.  
+```{r q12}
+census.del <- na.omit(census) %>%
+  mutate(Men = Men / TotalPop * 100) %>%
+  mutate(Employed = Employed / TotalPop * 100) %>%
+  mutate(Citizen = Citizen / TotalPop * 100) %>%
+  mutate(Minority = Hispanic + Black + Native + Asian + Pacific, .keep = "unused") %>%
+  select(-c(Walk, PublicWork, Construction, Women))
+```
+
+```{r q12_2, results="markup"}
+census.subct <- group_by(census.del, State, County) %>%
+  add_tally(TotalPop, name = "CountyTotal") %>%
+  mutate(weight = TotalPop / CountyTotal)
+
+census.ct <- census.subct %>%
+  summarize_at(vars(-group_cols(), -TotalPop), funs(sum(.*weight))) %>%
+  select(-weight)
+
+kable(head(census.ct))  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "900px")
+```
+
+### Dimension Reduction
+
+13. For the PCA of `census.ct` and `census.subct`, I choose to center and scale the features. Because the some of the variables are with different units than percentage. And the scale effects the PCA results. Therefore it's better to scale the features.  
+By `View()` the rotation matrix of the PCA report we can see that for `ct.pc`, the features with largest absolute values for PC1 are `IncomePerCap`, `ChildPoverty` and `Poverty`, and `IncomePerCap` has opposite signs against the other two features. For `subct.pc`, the features with largest absolute values for PC1 are `IncomePerCap`, `Professional` and `ChildPoverty`. Similarly, `ChildPoverty` has an opposite sign against the other two features. This means that these features affects the PC1 the most, but opposite sign implies that they lead PC1 to opposite directions.
+```{r q13}
+ct.pc <- prcomp(census.ct[,3:28], center = TRUE, scale = TRUE)
+subct.pc <- prcomp(census.subct[,3:28], center = TRUE, scale = TRUE)
+
+View(ct.pc$rotation)
+View(subct.pc$rotation)
+```
+
+
+
+14. The plots of PVE and cumulative PVE are shown below. And the minimum number of PCs needed to capture 90% of the variance for both of analysis is 15.
+```{r q14}
+ct_pve <- (ct.pc$sdev ^ 2) / sum(ct.pc$sdev ^ 2)
+ct_cumpve <- cumsum(ct_pve)
+
+subct_pve <- (subct.pc$sdev ^ 2) / sum(subct.pc$sdev ^ 2)
+subct_cumpve <- cumsum(subct_pve)
+
+min(which(ct_cumpve > 0.9))
+min(which(subct_cumpve > 0.9))
+```
+
+```{r q14_2, results="markup"}
+par(mfrow=c(1, 2))
+plot(ct_pve, type="l", lwd=3, main = "PVE of County PCA")
+plot(ct_cumpve, type="l", lwd=3, main = "Cum-PVE of County PCA")
+```
+
+```{r q14_3, results="markup"}
+par(mfrow=c(1, 2))
+plot(subct_pve, type="l", lwd=3, main = "PVE of Sub-County PCA")
+plot(subct_cumpve, type="l", lwd=3, main = "Cum-PVE of Sub-County PCA")
+```
+
+### Clustering
+
+15. From our clustering results, we found that San Mateo County is in cluster 2 for the original features clustering, but in cluster 7 in the first 5 PCs clustering. I think the clustering using the first 5 PCs is an more appropriate approach. Since the data were scaled at the beginning. And as we can see in the table of the number of counties in each cluster for the two clustering methods, we observe a more evenly split clusters in clustering with first 5 PCs than original features. So it is the more appropriate approach.
+```{r 15}
+census.ct.hclust <- hclust(dist(census.ct))
+ct.pc.hclust <- hclust(dist(ct.pc$x[,1:5]))
+
+ct.clus <- cutree(census.ct.hclust,10)
+ct.pc.clus <- cutree(ct.pc.hclust,10)
+
+which(census.ct$County == "San Mateo")
+
+ct.clus[227]
+ct.pc.clus[227]
+```
+```{r, results="markup"}
+table(ct.clus)
+table(ct.pc.clus)
+```
+
+### Classification
+
+```{r}
+tmpwinner <- county_winner %>% ungroup %>%
+  mutate(state = state.name[match(state, state.abb)]) %>%               ## state abbreviations
+  mutate_at(vars(state, county), tolower) %>%                           ## to all lowercase
+  mutate(county = gsub(" county| columbia| city| parish", "", county))  ## remove suffixes
+tmpcensus <- census.ct %>% mutate_at(vars(State, County), tolower)
+
+election.cl <- tmpwinner %>%
+  left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+
+## save meta information
+election.meta <- election.cl %>% select(c(county, fips, state, votes, pct, total))
+
+## save predictors and class labels
+election.cl = election.cl %>% select(-c(county, fips, state, votes, pct, total))
+```
+
+```{r}
+set.seed(10) 
+n <- nrow(election.cl)
+in.trn <- sample.int(n, 0.8*n) 
+trn.cl <- election.cl[ in.trn,]
+tst.cl <- election.cl[-in.trn,]
+```
+
+```{r}
+set.seed(20) 
+nfold <- 10
+folds <- sample(cut(1:nrow(trn.cl), breaks=nfold, labels=FALSE))
+```
+
+```{r}
+calc_error_rate = function(predicted.value, true.value){
+  return(mean(true.value!=predicted.value))
+}
+records = matrix(NA, nrow=3, ncol=2)
+colnames(records) = c("train.error","test.error")
+rownames(records) = c("tree","logistic","lasso")
+```
+
+```{r}
+trn.cl <- mutate(trn.cl, candidate = as.factor(ifelse(trn.cl$candidate == "Hillary Clinton", 
+                                                      "Hillary Clinton", "Donald Trump")))
+                
+tst.cl <- mutate(tst.cl, candidate = as.factor(ifelse(tst.cl$candidate == "Hillary Clinton", 
+                                                      "Hillary Clinton", "Donald Trump")))
+```
+
+
+16. Using the `trn.cl` data set, we built a decision tree and found the best size of the tree, which is 6, by using `cv.tree()`. From the summary of the pruned tree, we get the training error to be 0.08225, and a plot of the tree is shown below.  
+  From the plot we can see that the tree first divides on `transit`, which is the percentage of people commuting on public transportation. Then for a small `transit`, it further divides on the percentage of white people. for a large `transit`, it further divides number of the total population in the county. And we can see a large number of population will vote Clinton. For the dividing in white people, we see that a county with higher percentage of white people will vote to Trump. The county with smaller percentage of white people will be further divided by unemployment percentage. The counties with lower unemployment rate will vote to Trump.  
+  And we use the tree model to predict the `tst.cl` data set, we get the test error to be 0.0634.
+
+```{r 16}
+election.tree <- tree(candidate ~ ., data = trn.cl)
+
+election.tree.cv <- cv.tree(election.tree, rand = folds)
+
+best_size <- as.numeric(min(election.tree.cv$size[election.tree.cv$dev == min(election.tree.cv$dev)]))
+
+election.tree.pruned <- prune.tree(election.tree, best = best_size)
+
+summary(election.tree.pruned)
+
+records[1,1] <- 0.08225
+```
+
+```{r 16_2, results="markup"}
+draw.tree(election.tree.pruned, nodeinfo = TRUE, cex = 0.55)
+```
+
+```{r 16_3}
+election.tree.predict <- predict(election.tree, tst.cl, type = "class")
+records[1,2] <- calc_error_rate(election.tree.predict, tst.cl$candidate)
+```
+
+
+17. From the summary of the logistic regression we can see that the following features are significant: `Men`, `White`, `Citizen`, `Income`, `IncomePerCap`, `IncomePerCapErr`, `Professional`, `Service`, `Production`, `Drive`, `Carpool`, `WorkAtHome`, `MeanCommute`, `Empolyed`, `PrivateWork`, `FamiltyWork` and `Unemployement`. Most of the features used in the tree method is also in this list, such as `White`, `Production`, `Unemployement`. The training error is 0.0704 and the testing error is 0.0634. 
+
+```{r 17}
+election.logis <- glm(candidate ~ . , data = trn.cl, family = "binomial")
+
+summary(election.logis)
+```
+
+```{r 17_2}
+election.logis.train.pred <- predict(election.logis, trn.cl, type ="response")
+election.logis.train.pred <- as.factor(ifelse(election.logis.train.pred >= 0.5, "Hillary Clinton", "Donald Trump"))
+
+election.logis.train.err <- calc_error_rate(election.logis.train.pred, trn.cl$candidate)
+
+records[2,1] <- election.logis.train.err
+```
+
+```{r 17_3}
+election.logis.test.pred <- predict(election.logis, tst.cl, type = "response")
+election.logis.test.pred <- as.factor(ifelse(election.logis.test.pred >= 0.5, "Hillary Clinton", "Donald Trump"))
+
+election.logis.test.error <- calc_error_rate(election.logis.test.pred, tst.cl$candidate)
+
+records[2,2] <- election.logis.test.error
+```
+
+
+18. The optimal value of $\lambda$ is $5 \times 10^{-4}$. The training error is 0.06962541 and the test error is 0.06504065. And a full records table is shown below.
+```{r 18}
+x = model.matrix(candidate ~ ., data = trn.cl)[,-1]
+y = trn.cl$candidate
+
+election.lasso <- glmnet(x, y, alpha = 1, family = "binomial")
+
+lambda = c(1, 5, 10, 50) * 1e-4
+
+election.lasso.cv <- cv.glmnet(x, y, alpha = 1, lambda = lambda, family = "binomial")
+best_lam <- election.lasso.cv$lambda.min
+
+
+election.lasso.train.pred <- predict(election.lasso, type = "response", s = best_lam, newx = x)
+election.lasso.train.pred <- as.factor(ifelse(election.lasso.train.pred >= 0.5, "Hillary Clinton", "Donald Trump"))
+
+election.lasso.test.pred <- predict(election.lasso, type = "response", 
+                                    s = best_lam, newx = model.matrix(candidate ~ . , data = tst.cl)[,-1])
+election.lasso.test.pred <- as.factor(ifelse(election.lasso.test.pred >= 0.5, "Hillary Clinton", "Donald Trump"))
+
+election.lasso.train.err <- calc_error_rate(election.lasso.train.pred, y)
+election.lasso.test.err <- calc_error_rate(election.lasso.test.pred, tst.cl$candidate)
+
+records[3,1] <- election.lasso.train.err
+records[3,2] <- election.lasso.test.err
+```
+
+```{r 18_2, results="markup"}
+kable(records)  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+19. From the plot and get the AUC value we can get that Lasso regression methods has the largest AUC, which implies Lasso regression is a better model than the other two.
+
+```{r 19, results="markup"}
+# Tree
+pred_tree <- prediction(predict(election.tree, tst.cl, type = "vector")[,2],tst.cl$candidate)
+perf_tree <- performance(pred_tree, measure = "tpr", x.measure = "fpr")
+plot(perf_tree, col = "green", lwd = 2)
+
+
+# Logis
+pred_logis <- prediction(predict(election.logis, tst.cl, type = "response"), tst.cl$candidate)
+perf_logis <- performance(pred_logis, measure = "tpr", x.measure = "fpr")
+plot(perf_logis, col = "red", add = TRUE, lwd = 2)
+
+# Lasso
+pred_lasso <- prediction(predict(election.lasso, newx = model.matrix(candidate ~ . , data = tst.cl)[,-1]
+                                 , type = "response", s = best_lam), tst.cl$candidate)
+perf_lasso <- performance(pred_lasso, measure = "tpr", x.measure = "fpr")
+plot(perf_lasso, col = "blue", add = TRUE, lwd = 2)
+
+legend(0.7, 0.4, legend=c("Tree ROC", "Logistic ROC", "Lasso ROC"),
+col=c("green", "red", "blue"), lty=1:1, cex=0.8)
+```
+
+```{r}
+performance(pred_tree, "auc")@y.values
+performance(pred_logis, "auc")@y.values
+performance(pred_lasso, "auc")@y.values
+```
+
+### Taking it further
+
+20. In this question, First I'm going to explore the classification using principle components with logistic regression. Then I'm going to try using random forest and boosting on the original data to get models and see how they behaves. And we'll set another record matrix to save these models' training and testing error.
+
+```{r}
+records_2 = matrix(NA, nrow=3, ncol=2)
+colnames(records_2) = c("train.error","test.error")
+rownames(records_2) = c("pc_logis","boosting","random forest")
+```
+
+
+#### Logistic Regression Using Principle Components
+From the PVE plot produced earlier in the report, we see that the cumPVE explains 90% of the variance at about 15 PCs. So I'm using the first 15 PCs to create a logistic regression model. We first combine the 15 PCs with the county_winner using the methods above, and split the data set into training and testing sets using the same separating index above. Then perform the logistic regression using `glm()` function.  
+This time we still get a warning of fitted probability numerically 0 or 1 occurred, this implies this model is still tend to overfitting. Maybe we need to reduce the number of PC using, but too few PC will lead to a greater bias, so let's stick to 15 PCs for now.
+The summary of the logistic regression and the training and test error of this model is shown below. The training error is 0.0814332 and the testing error is 0.06341463. We surprisingly found that the testing error is identical with the logistic regression model with the original features.
+
+```{r}
+pc_data <- as.data.frame(ct.pc$x[,1:15])
+
+pc_data <- cbind(census.ct[,1:2], pc_data)
+
+tmpwinner <- county_winner %>% ungroup %>%
+  mutate(state = state.name[match(state, state.abb)]) %>%               ## state abbreviations
+  mutate_at(vars(state, county), tolower) %>%                           ## to all lowercase
+  mutate(county = gsub(" county| columbia| city| parish", "", county))  ## remove suffixes
+tmpcensus <- pc_data %>% mutate_at(vars(State, County), tolower)
+
+pc_data <- tmpwinner %>%
+  left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+
+pc_data <- pc_data %>% select(-c(county, fips, state, votes, pct, total))
+```
+
+```{r}
+pc_trn <- pc_data[in.trn,]
+pc_tst <- pc_data[-in.trn,]
+```
+
+```{r}
+pc_trn <- mutate(pc_trn, candidate = as.factor(ifelse(pc_trn$candidate == "Hillary Clinton", 
+                                                      "Hillary Clinton", "Donald Trump")))
+                
+pc_tst <- mutate(pc_tst, candidate = as.factor(ifelse(pc_tst$candidate == "Hillary Clinton", 
+                                                      "Hillary Clinton", "Donald Trump")))
+```
+
+```{r, results = "markup"}
+pc_logis <- glm(candidate ~ ., data = pc_trn, family = "binomial")
+summary(pc_logis)
+```
+
+```{r, results= "markup"}
+pc_glm_train_pred <- predict(pc_logis, pc_trn, type = "response")
+pc_glm_train_pred <- as.factor(ifelse(pc_glm_train_pred >= 0.5, "Hillary Clinton", "Donald Trump"))
+pc_glm_train_err <- calc_error_rate(pc_glm_train_pred, pc_trn$candidate)
+
+pc_glm_test_pred <- predict(pc_logis, pc_tst, type = "response")
+pc_glm_test_pred <- as.factor(ifelse(pc_glm_test_pred >= 0.5, "Hillary Clinton", "Donald Trump"))
+pc_glm_test_err <- calc_error_rate(pc_glm_test_pred, pc_tst$candidate)
+
+kable(cbind(pc_glm_train_err, pc_glm_test_err))  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+
+records_2[1,1] <- pc_glm_train_err
+records_2[1,2] <- pc_glm_test_err
+```
+
+
+However when we look into the ROC curve and AUC value, we find the AUC value to be 0.9520671, which is larger than all of the three models above, suggesting this model would give as a more accurate predict on testing data sets.
+```{r, results="markup"}
+pc_pred_glm <- prediction(predict(pc_logis, pc_tst, type ="response"),
+                          pc_tst$candidate)
+pc_perf_glm <- performance(pc_pred_glm, measure = "tpr", x.measure = "fpr")
+plot(pc_perf_glm)
+```
+```{r}
+performance(pc_pred_glm, "auc")@y.values
+```
+
+
+#### Random Forest and Boosting
+First we perform a boost on the training data set using 1000 trees. From the summary of the `gbm()` function we can see the features with the highest importance is `Transit`, this is consistent with what we observed in the tree method that `Transit` is working as the first node in the tree. Also, several other features with high importance also appeared in the tree nodes. And from our prediction with the model, we get our training and testing error to be 0.06026059 and 0.06504065 respectively. We can see that the testing error of the boosting model is still higher than both of the logistic regression fit. This is probably because boosting is just a weak leaner, it does not have a high performance on predicting.
+```{r, results="markup"}
+trn.cl.boost <- gbm(ifelse(candidate == "Hillary Clinton", 1, 0) ~ ., data = trn.cl,
+                    distribution = "bernoulli", n.trees = 1000, shrinkage = 0.01)
+kable(head(summary(trn.cl.boost)[2])) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+```{r}
+trn.boost.predict <- predict(trn.cl.boost, trn.cl, type = "response")
+trn.boost.predict <- as.factor(ifelse(trn.boost.predict <= 0.5, "Donald Trump", "Hillary Clinton"))
+boost.trn.err <- calc_error_rate(trn.boost.predict, trn.cl$candidate)
+
+tst.boost.predict <- predict(trn.cl.boost, tst.cl, type = "response")
+tst.boost.predict <- as.factor(ifelse(tst.boost.predict <=0.5, "Donald Trump", "Hillary Clinton"))
+boost.test.err <- calc_error_rate(tst.boost.predict, tst.cl$candidate)
+
+records_2[2,1] <- boost.trn.err 
+records_2[2,2] <- boost.test.err
+```
+
+
+
+The Summary of the Random Forest model is shown below, we can see the train error is only 0.057, which is ver small compare to all other models we fitted above. Also, from the `importance()` function we can see that transit is still the feature with the highest importance. And with our prediction, we get the test error to be 0.04390244. Which is the lowest across all the model we have. So I would conclude this will be the best model in my research. However, the trade off for this model is that random forest is usually hard to interpret. We can only know the importance of the features, but don't have a clear separation like the single tree method.
+```{r, results="markup"}
+set.seed(10)
+
+trn.cl.rf <- randomForest(candidate ~ ., data = trn.cl, importance = TRUE)
+
+print(trn.cl.rf)
+```
+
+```{r}
+kable(head(importance(trn.cl.rf)[order(importance(trn.cl.rf)[,4],decreasing = TRUE),])) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+```{r}
+tst.rf.predict <- predict(trn.cl.rf, tst.cl, type = "prob")
+tst.rf.predict <- as.factor(ifelse(tst.rf.predict[,2] <= 0.5, "Donald Trump", "Hillary Clinton"))
+rf.test.err <- calc_error_rate(tst.rf.predict, tst.cl$candidate)
+
+records_2[3,1] <- 0.057
+records_2[3,2] <- rf.test.err
+```
+
+```{r, results="markup"}
+kable(records_2)  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
